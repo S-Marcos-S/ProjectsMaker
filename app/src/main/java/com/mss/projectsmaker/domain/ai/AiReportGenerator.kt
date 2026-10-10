@@ -94,29 +94,35 @@ Retorne ESTRITAMENTE um objeto JSON válido (sem tags markdown adicionais fora d
     }
 
     private fun callGemini(settings: AiSettings, prompt: String): String {
-        val candidateModels = mutableListOf<String>()
-        val selectedModel = settings.getDefaultModel()
-        candidateModels.add(selectedModel)
+        // Query the Gemini API directly for models that actually exist and support generateContent for this key
+        val availableModels = fetchAvailableGeminiModels(settings.apiKey)
 
-        // Automatic fallback models in case of high demand (503) or unavailability
-        val fallbacks = listOf("gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash")
-        for (fb in fallbacks) {
-            if (!candidateModels.contains(fb)) {
-                candidateModels.add(fb)
+        val candidateModels = mutableListOf<String>()
+        val requestedModel = settings.getDefaultModel().trim()
+
+        if (requestedModel.isNotBlank()) {
+            candidateModels.add(requestedModel)
+        }
+
+        // Add available models returned by the API
+        for (m in availableModels) {
+            val simpleName = m.removePrefix("models/")
+            if (!candidateModels.contains(simpleName)) {
+                candidateModels.add(simpleName)
             }
         }
 
         var lastException: Exception? = null
 
         for (model in candidateModels) {
-            // Attempt with exponential backoff on 503 (high demand)
             var attempts = 0
-            val maxAttempts = 3
+            val maxAttempts = 2
             var delayMs = 1500L
 
             while (attempts < maxAttempts) {
                 attempts++
-                val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=${settings.apiKey}"
+                val cleanModel = model.removePrefix("models/")
+                val url = "https://generativelanguage.googleapis.com/v1beta/models/$cleanModel:generateContent?key=${settings.apiKey}"
 
                 val requestBody = buildJsonObject {
                     putJsonArray("contents") {
@@ -130,7 +136,6 @@ Retorne ESTRITAMENTE um objeto JSON válido (sem tags markdown adicionais fora d
                     }
                     putJsonObject("generationConfig") {
                         put("responseMimeType", "application/json")
-                        put("temperature", 0.7)
                     }
                 }.toString().toRequestBody("application/json".toMediaType())
 
@@ -144,20 +149,25 @@ Retorne ESTRITAMENTE um objeto JSON válido (sem tags markdown adicionais fora d
                         val responseString = response.body?.string().orEmpty()
 
                         if (response.code == 503 || response.code == 429) {
-                            // Model overloaded, retry after waiting or try next model
                             if (attempts < maxAttempts) {
                                 Thread.sleep(delayMs)
                                 delayMs *= 2
-                                return@use // retry loop
+                                return@use
                             } else {
-                                lastException = IllegalStateException("Modelo $model em alta demanda (503). Alternando modelo...")
-                                return@use // try next candidate model
+                                lastException = IllegalStateException("Modelo $cleanModel sobrecarregado (503/429). Tentando outro modelo...")
+                                return@use
                             }
                         }
 
+                        if (response.code == 404) {
+                            // Model not found or retired, silently move to the next valid model
+                            lastException = IllegalStateException("Modelo $cleanModel não encontrado (404).")
+                            return@use
+                        }
+
                         if (!response.isSuccessful) {
-                            lastException = IllegalStateException("Erro na Gemini API ($model - ${response.code}): $responseString")
-                            return@use // try next model
+                            lastException = IllegalStateException("Erro na Gemini API ($cleanModel - ${response.code}): $responseString")
+                            return@use
                         }
 
                         val root = json.parseToJsonElement(responseString).jsonObject
@@ -169,7 +179,7 @@ Retorne ESTRITAMENTE um objeto JSON válido (sem tags markdown adicionais fora d
                         return text
                     }
                 } catch (e: java.net.UnknownHostException) {
-                    throw IllegalStateException("Sem conexão com a internet ou erro de DNS ao acessar generativelanguage.googleapis.com. Verifique seu Wi-Fi/4G.")
+                    throw IllegalStateException("Sem conexão com a internet ou erro de DNS ao acessar generativelanguage.googleapis.com.")
                 } catch (e: Exception) {
                     lastException = e
                     if (attempts < maxAttempts) {
@@ -180,7 +190,34 @@ Retorne ESTRITAMENTE um objeto JSON válido (sem tags markdown adicionais fora d
             }
         }
 
-        throw lastException ?: IllegalStateException("Não foi possível obter resposta da Gemini API após tentativas.")
+        throw lastException ?: IllegalStateException("Não foi possível gerar resposta com nenhum modelo Gemini disponível na sua conta.")
+    }
+
+    suspend fun getAvailableGeminiModels(apiKey: String): List<String> = withContext(Dispatchers.IO) {
+        fetchAvailableGeminiModels(apiKey).map { it.removePrefix("models/") }
+    }
+
+    private fun fetchAvailableGeminiModels(apiKey: String): List<String> {
+        if (apiKey.isBlank()) return emptyList()
+        return try {
+            val url = "https://generativelanguage.googleapis.com/v1beta/models?key=$apiKey"
+            val request = Request.Builder().url(url).get().build()
+            client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) return emptyList()
+                val bodyStr = response.body?.string().orEmpty()
+                val root = json.parseToJsonElement(bodyStr).jsonObject
+                val modelsArray = root["models"]?.jsonArray ?: return emptyList()
+
+                modelsArray.mapNotNull { element ->
+                    val obj = element.jsonObject
+                    val name = obj["name"]?.jsonPrimitive?.content ?: return@mapNotNull null
+                    val methods = obj["supportedGenerationMethods"]?.jsonArray?.map { it.jsonPrimitive.content } ?: emptyList()
+                    if (methods.contains("generateContent")) name else null
+                }
+            }
+        } catch (e: Exception) {
+            emptyList()
+        }
     }
 
     private fun callOpenAiCompatible(settings: AiSettings, prompt: String): String {
