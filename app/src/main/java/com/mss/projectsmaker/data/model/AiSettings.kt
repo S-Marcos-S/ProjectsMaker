@@ -20,7 +20,7 @@ data class AiSettings(
     fun getDefaultModel(): String {
         if (customModel.isNotBlank()) return customModel
         return when (provider) {
-            AiProvider.GEMINI -> "gemini-1.5-flash"
+            AiProvider.GEMINI -> "gemini-3.8-flash"
             AiProvider.OPENAI -> "gpt-4o-mini"
             AiProvider.GROQ -> "llama-3.3-70b-versatile"
             AiProvider.CLAUDE -> "claude-3-5-sonnet-20241022"
