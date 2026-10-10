@@ -125,6 +125,13 @@ Retorne ESTRITAMENTE um objeto JSON válido (sem tags markdown adicionais fora d
                 val url = "https://generativelanguage.googleapis.com/v1beta/models/$cleanModel:generateContent?key=${settings.apiKey}"
 
                 val requestBody = buildJsonObject {
+                    putJsonObject("system_instruction") {
+                        putJsonArray("parts") {
+                            add(buildJsonObject {
+                                put("text", "Você é um assistente acadêmico técnico. Você DEVE responder ESTRITAMENTE um JSON estruturado com os campos solicitados, sem preâmbulo, sem saudações e sem comentários fora do JSON.")
+                            })
+                        }
+                    }
                     putJsonArray("contents") {
                         add(buildJsonObject {
                             putJsonArray("parts") {
@@ -136,6 +143,27 @@ Retorne ESTRITAMENTE um objeto JSON válido (sem tags markdown adicionais fora d
                     }
                     putJsonObject("generationConfig") {
                         put("responseMimeType", "application/json")
+                        putJsonObject("responseSchema") {
+                            put("type", "object")
+                            putJsonObject("properties") {
+                                putJsonObject("title") { put("type", "string") }
+                                putJsonObject("resumo") { put("type", "string") }
+                                putJsonObject("introducao") { put("type", "string") }
+                                putJsonObject("objetivos") { put("type", "string") }
+                                putJsonObject("metodos") { put("type", "string") }
+                                putJsonObject("resultados") { put("type", "string") }
+                                putJsonObject("conclusao") { put("type", "string") }
+                            }
+                            putJsonArray("required") {
+                                add(kotlinx.serialization.json.JsonPrimitive("title"))
+                                add(kotlinx.serialization.json.JsonPrimitive("resumo"))
+                                add(kotlinx.serialization.json.JsonPrimitive("introducao"))
+                                add(kotlinx.serialization.json.JsonPrimitive("objetivos"))
+                                add(kotlinx.serialization.json.JsonPrimitive("metodos"))
+                                add(kotlinx.serialization.json.JsonPrimitive("resultados"))
+                                add(kotlinx.serialization.json.JsonPrimitive("conclusao"))
+                            }
+                        }
                     }
                 }.toString().toRequestBody("application/json".toMediaType())
 
