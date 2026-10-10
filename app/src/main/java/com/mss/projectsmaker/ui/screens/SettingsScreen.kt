@@ -139,14 +139,38 @@ fun SettingsScreen(
 
                     Spacer(modifier = Modifier.height(12.dp))
 
-                    // Custom model (optional)
+                    // Model Selection with quick presets
                     OutlinedTextField(
                         value = customModel,
                         onValueChange = { customModel = it },
-                        label = { Text("Modelo (Opcional)") },
+                        label = { Text("Modelo da IA") },
                         placeholder = { Text(AiSettings(provider = selectedProvider).getDefaultModel()) },
+                        supportingText = { Text("Padrão: ${AiSettings(provider = selectedProvider).getDefaultModel()}") },
                         modifier = Modifier.fillMaxWidth()
                     )
+
+                    Spacer(modifier = Modifier.height(6.dp))
+
+                    Text(
+                        text = "Modelos recomendados (toque para selecionar):",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.outline
+                    )
+
+                    Spacer(modifier = Modifier.height(4.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        AiSettings.getPresetModels(selectedProvider).take(3).forEach { preset ->
+                            FilterChip(
+                                selected = (customModel == preset) || (customModel.isBlank() && preset == AiSettings(provider = selectedProvider).getDefaultModel()),
+                                onClick = { customModel = preset },
+                                label = { Text(preset, style = MaterialTheme.typography.labelSmall) }
+                            )
+                        }
+                    }
                 }
             }
 

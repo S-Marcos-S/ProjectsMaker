@@ -94,43 +94,93 @@ Retorne ESTRITAMENTE um objeto JSON válido (sem tags markdown adicionais fora d
     }
 
     private fun callGemini(settings: AiSettings, prompt: String): String {
-        val model = settings.getDefaultModel()
-        val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=${settings.apiKey}"
+        val candidateModels = mutableListOf<String>()
+        val selectedModel = settings.getDefaultModel()
+        candidateModels.add(selectedModel)
 
-        val requestBody = buildJsonObject {
-            putJsonArray("contents") {
-                add(buildJsonObject {
-                    putJsonArray("parts") {
+        // Automatic fallback models in case of high demand (503) or unavailability
+        val fallbacks = listOf("gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash")
+        for (fb in fallbacks) {
+            if (!candidateModels.contains(fb)) {
+                candidateModels.add(fb)
+            }
+        }
+
+        var lastException: Exception? = null
+
+        for (model in candidateModels) {
+            // Attempt with exponential backoff on 503 (high demand)
+            var attempts = 0
+            val maxAttempts = 3
+            var delayMs = 1500L
+
+            while (attempts < maxAttempts) {
+                attempts++
+                val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=${settings.apiKey}"
+
+                val requestBody = buildJsonObject {
+                    putJsonArray("contents") {
                         add(buildJsonObject {
-                            put("text", prompt)
+                            putJsonArray("parts") {
+                                add(buildJsonObject {
+                                    put("text", prompt)
+                                })
+                            }
                         })
                     }
-                })
-            }
-            putJsonObject("generationConfig") {
-                put("responseMimeType", "application/json")
-                put("temperature", 0.7)
-            }
-        }.toString().toRequestBody("application/json".toMediaType())
+                    putJsonObject("generationConfig") {
+                        put("responseMimeType", "application/json")
+                        put("temperature", 0.7)
+                    }
+                }.toString().toRequestBody("application/json".toMediaType())
 
-        val request = Request.Builder()
-            .url(url)
-            .post(requestBody)
-            .build()
+                val request = Request.Builder()
+                    .url(url)
+                    .post(requestBody)
+                    .build()
 
-        client.newCall(request).execute().use { response ->
-            val responseString = response.body?.string().orEmpty()
-            if (!response.isSuccessful) {
-                throw IllegalStateException("Erro na Gemini API (${response.code}): $responseString")
+                try {
+                    client.newCall(request).execute().use { response ->
+                        val responseString = response.body?.string().orEmpty()
+
+                        if (response.code == 503 || response.code == 429) {
+                            // Model overloaded, retry after waiting or try next model
+                            if (attempts < maxAttempts) {
+                                Thread.sleep(delayMs)
+                                delayMs *= 2
+                                return@use // retry loop
+                            } else {
+                                lastException = IllegalStateException("Modelo $model em alta demanda (503). Alternando modelo...")
+                                return@use // try next candidate model
+                            }
+                        }
+
+                        if (!response.isSuccessful) {
+                            lastException = IllegalStateException("Erro na Gemini API ($model - ${response.code}): $responseString")
+                            return@use // try next model
+                        }
+
+                        val root = json.parseToJsonElement(responseString).jsonObject
+                        val text = root["candidates"]?.jsonArray?.getOrNull(0)?.jsonObject
+                            ?.get("content")?.jsonObject
+                            ?.get("parts")?.jsonArray?.getOrNull(0)?.jsonObject
+                            ?.get("text")?.jsonPrimitive?.content
+                            ?: throw IllegalStateException("Resposta inesperada do Gemini: $responseString")
+                        return text
+                    }
+                } catch (e: java.net.UnknownHostException) {
+                    throw IllegalStateException("Sem conexão com a internet ou erro de DNS ao acessar generativelanguage.googleapis.com. Verifique seu Wi-Fi/4G.")
+                } catch (e: Exception) {
+                    lastException = e
+                    if (attempts < maxAttempts) {
+                        Thread.sleep(delayMs)
+                        delayMs *= 2
+                    }
+                }
             }
-            val root = json.parseToJsonElement(responseString).jsonObject
-            val text = root["candidates"]?.jsonArray?.getOrNull(0)?.jsonObject
-                ?.get("content")?.jsonObject
-                ?.get("parts")?.jsonArray?.getOrNull(0)?.jsonObject
-                ?.get("text")?.jsonPrimitive?.content
-                ?: throw IllegalStateException("Resposta inesperada do Gemini: $responseString")
-            return text
         }
+
+        throw lastException ?: IllegalStateException("Não foi possível obter resposta da Gemini API após tentativas.")
     }
 
     private fun callOpenAiCompatible(settings: AiSettings, prompt: String): String {
