@@ -304,17 +304,27 @@ Retorne ESTRITAMENTE um objeto JSON válido (sem tags markdown adicionais fora d
 
     private fun parseReportJson(rawText: String): GeneratedReportContent {
         var clean = rawText.trim()
-        if (clean.startsWith("```json")) {
-            clean = clean.removePrefix("```json").trim()
-        }
-        if (clean.startsWith("```")) {
-            clean = clean.removePrefix("```").trim()
-        }
-        if (clean.endsWith("```")) {
-            clean = clean.removeSuffix("```").trim()
+
+        // 1. If wrapped in markdown code blocks, extract inner content
+        val markdownRegex = """```(?:json)?\s*([\s\S]*?)\s*```""".toRegex()
+        val match = markdownRegex.find(clean)
+        if (match != null) {
+            clean = match.groupValues[1].trim()
         }
 
-        val jsonObject = json.parseToJsonElement(clean).jsonObject
+        // 2. Extract JSON object from first '{' to last '}' in case the model outputs introductory or conversational text
+        val firstBrace = clean.indexOf('{')
+        val lastBrace = clean.lastIndexOf('}')
+        if (firstBrace != -1 && lastBrace != -1 && lastBrace > firstBrace) {
+            clean = clean.substring(firstBrace, lastBrace + 1).trim()
+        }
+
+        val jsonObject = try {
+            json.parseToJsonElement(clean).jsonObject
+        } catch (e: Exception) {
+            throw IllegalStateException("Falha ao interpretar resposta da IA como JSON: ${e.message}\nResposta bruta: ${rawText.take(300)}")
+        }
+
         return GeneratedReportContent(
             title = jsonObject["title"]?.jsonPrimitive?.content.orEmpty(),
             resumo = jsonObject["resumo"]?.jsonPrimitive?.content.orEmpty(),
