@@ -1,0 +1,241 @@
+package com.mss.projectsmaker.domain.ai
+
+import com.mss.projectsmaker.data.model.AiProvider
+import com.mss.projectsmaker.data.model.AiSettings
+import com.mss.projectsmaker.domain.docx.GeneratedReportContent
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonArray
+import kotlinx.serialization.json.putJsonObject
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import java.util.concurrent.TimeUnit
+
+class AiReportGenerator(
+    private val client: OkHttpClient = OkHttpClient.Builder()
+        .connectTimeout(60, TimeUnit.SECONDS)
+        .readTimeout(180, TimeUnit.SECONDS)
+        .writeTimeout(60, TimeUnit.SECONDS)
+        .build(),
+    private val json: Json = Json { ignoreUnknownKeys = true; isLenient = true }
+) {
+
+    suspend fun generateReport(
+        settings: AiSettings,
+        guidePdfText: String,
+        templateSections: List<String>,
+        userExtraContext: String
+    ): Result<GeneratedReportContent> = withContext(Dispatchers.IO) {
+        runCatching {
+            if (settings.apiKey.isBlank()) {
+                throw IllegalArgumentException("A chave de API não foi informada nas configurações.")
+            }
+
+            val prompt = buildPrompt(guidePdfText, templateSections, userExtraContext)
+
+            val rawResponse = when (settings.provider) {
+                AiProvider.GEMINI -> callGemini(settings, prompt)
+                AiProvider.OPENAI,
+                AiProvider.GROQ,
+                AiProvider.DEEPSEEK -> callOpenAiCompatible(settings, prompt)
+                AiProvider.CLAUDE -> callClaude(settings, prompt)
+            }
+
+            parseReportJson(rawResponse)
+        }
+    }
+
+    private fun buildPrompt(
+        guidePdfText: String,
+        templateSections: List<String>,
+        userExtraContext: String
+    ): String {
+        return """
+Você é um especialista acadêmico e técnico encarregado de redigir um RELATÓRIO DE AULA PRÁTICA acadêmico completo e impecável.
+
+OBJETIVO:
+Você deve escrever o relatório como se o aluno TIVESSE REALIZADO E CONCLUÍDO COM SUCESSO todas as etapas descritas no guia de resolução da aula prática.
+Escreva de maneira formal, clara, técnica e explicativa (linguagem acadêmica em 1ª pessoa do plural ou impessoal).
+
+IMPORTANTE SOBRE IMAGENS/PRINTS:
+- O relatório DEVE conter referências a figuras/prints e deixar o marcador explicito para a imagem ser inserida depois pelo aluno.
+- Exemplo no texto: "Após a instalação do serviço, iniciamos a criação das tabelas no banco de dados, como ilustrado na Figura 1."
+- E logo abaixo no parágrafo seguinte, coloque a marcação:
+[FIGURA 1: Inserir print da tela mostrando a criação das tabelas no console/interface]
+- Faça isso para todas as etapas práticas necessárias (Figura 1, Figura 2, Figura 3...).
+
+CONTEÚDO DO GUIA DA AULA PRÁTICA (PDF):
+$guidePdfText
+
+CONTEXTO ADICIONAL DO ALUNO:
+${if (userExtraContext.isNotBlank()) userExtraContext else "Nenhum contexto extra fornecido. Siga fielmente o roteiro."}
+
+FORMATO DA RESPOSTA (MUITO IMPORTANTE):
+Retorne ESTRITAMENTE um objeto JSON válido (sem tags markdown adicionais fora do JSON, ou com ```json) com a seguinte estrutura exata de chaves:
+{
+  "title": "Título resumido da aula prática ou tema abordado",
+  "resumo": "Texto completo do resumo sintetizando o objetivo da aula, ferramentas usadas e resultados obtidos.",
+  "introducao": "Texto completo da introdução conceituando o tema, tecnologias envolvidas e importância prática.",
+  "objetivos": "Lista clara e detalhada dos objetivos atingidos no trabalho.",
+  "metodos": "Passo a passo minucioso e explicativo de como a atividade foi executada, ferramentas instaladas/configuradas, com as marcações de figuras/prints.",
+  "resultados": "Apresentação dos resultados finais, código/diagrama/consultas executadas, detalhamento do que foi alcançado e prints finais.",
+  "conclusao": "Conclusão e considerações finais, explicando o aprendizado, classes/recursos criados e cumprimento de todos os requisitos do roteiro."
+}
+""".trimIndent()
+    }
+
+    private fun callGemini(settings: AiSettings, prompt: String): String {
+        val model = settings.getDefaultModel()
+        val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=${settings.apiKey}"
+
+        val requestBody = buildJsonObject {
+            putJsonArray("contents") {
+                add(buildJsonObject {
+                    putJsonArray("parts") {
+                        add(buildJsonObject {
+                            put("text", prompt)
+                        })
+                    }
+                })
+            }
+            putJsonObject("generationConfig") {
+                put("responseMimeType", "application/json")
+                put("temperature", 0.7)
+            }
+        }.toString().toRequestBody("application/json".toMediaType())
+
+        val request = Request.Builder()
+            .url(url)
+            .post(requestBody)
+            .build()
+
+        client.newCall(request).execute().use { response ->
+            val responseString = response.body?.string().orEmpty()
+            if (!response.isSuccessful) {
+                throw IllegalStateException("Erro na Gemini API (${response.code}): $responseString")
+            }
+            val root = json.parseToJsonElement(responseString).jsonObject
+            val text = root["candidates"]?.jsonArray?.getOrNull(0)?.jsonObject
+                ?.get("content")?.jsonObject
+                ?.get("parts")?.jsonArray?.getOrNull(0)?.jsonObject
+                ?.get("text")?.jsonPrimitive?.content
+                ?: throw IllegalStateException("Resposta inesperada do Gemini: $responseString")
+            return text
+        }
+    }
+
+    private fun callOpenAiCompatible(settings: AiSettings, prompt: String): String {
+        val baseUrl = when (settings.provider) {
+            AiProvider.OPENAI -> "https://api.openai.com/v1/chat/completions"
+            AiProvider.GROQ -> "https://api.groq.com/openai/v1/chat/completions"
+            AiProvider.DEEPSEEK -> "https://api.deepseek.com/chat/completions"
+            else -> "https://api.openai.com/v1/chat/completions"
+        }
+
+        val model = settings.getDefaultModel()
+
+        val requestBody = buildJsonObject {
+            put("model", model)
+            putJsonArray("messages") {
+                add(buildJsonObject {
+                    put("role", "system")
+                    put("content", "Você é um assistente acadêmico técnico. Retorne SEMPRE sua resposta em formato JSON válido.")
+                })
+                add(buildJsonObject {
+                    put("role", "user")
+                    put("content", prompt)
+                })
+            }
+            putJsonObject("response_format") {
+                put("type", "json_object")
+            }
+        }.toString().toRequestBody("application/json".toMediaType())
+
+        val request = Request.Builder()
+            .url(baseUrl)
+            .header("Authorization", "Bearer ${settings.apiKey}")
+            .post(requestBody)
+            .build()
+
+        client.newCall(request).execute().use { response ->
+            val responseString = response.body?.string().orEmpty()
+            if (!response.isSuccessful) {
+                throw IllegalStateException("Erro na API ${settings.provider.displayName} (${response.code}): $responseString")
+            }
+            val root = json.parseToJsonElement(responseString).jsonObject
+            val text = root["choices"]?.jsonArray?.getOrNull(0)?.jsonObject
+                ?.get("message")?.jsonObject
+                ?.get("content")?.jsonPrimitive?.content
+                ?: throw IllegalStateException("Resposta inesperada: $responseString")
+            return text
+        }
+    }
+
+    private fun callClaude(settings: AiSettings, prompt: String): String {
+        val url = "https://api.anthropic.com/v1/messages"
+        val model = settings.getDefaultModel()
+
+        val requestBody = buildJsonObject {
+            put("model", model)
+            put("max_tokens", 4096)
+            putJsonArray("messages") {
+                add(buildJsonObject {
+                    put("role", "user")
+                    put("content", prompt)
+                })
+            }
+        }.toString().toRequestBody("application/json".toMediaType())
+
+        val request = Request.Builder()
+            .url(url)
+            .header("x-api-key", settings.apiKey)
+            .header("anthropic-version", "2023-06-01")
+            .post(requestBody)
+            .build()
+
+        client.newCall(request).execute().use { response ->
+            val responseString = response.body?.string().orEmpty()
+            if (!response.isSuccessful) {
+                throw IllegalStateException("Erro na Anthropic Claude API (${response.code}): $responseString")
+            }
+            val root = json.parseToJsonElement(responseString).jsonObject
+            val text = root["content"]?.jsonArray?.getOrNull(0)?.jsonObject
+                ?.get("text")?.jsonPrimitive?.content
+                ?: throw IllegalStateException("Resposta vazia da Claude API.")
+            return text
+        }
+    }
+
+    private fun parseReportJson(rawText: String): GeneratedReportContent {
+        var clean = rawText.trim()
+        if (clean.startsWith("```json")) {
+            clean = clean.removePrefix("```json").trim()
+        }
+        if (clean.startsWith("```")) {
+            clean = clean.removePrefix("```").trim()
+        }
+        if (clean.endsWith("```")) {
+            clean = clean.removeSuffix("```").trim()
+        }
+
+        val jsonObject = json.parseToJsonElement(clean).jsonObject
+        return GeneratedReportContent(
+            title = jsonObject["title"]?.jsonPrimitive?.content.orEmpty(),
+            resumo = jsonObject["resumo"]?.jsonPrimitive?.content.orEmpty(),
+            introducao = jsonObject["introducao"]?.jsonPrimitive?.content.orEmpty(),
+            objetivos = jsonObject["objetivos"]?.jsonPrimitive?.content.orEmpty(),
+            metodos = jsonObject["metodos"]?.jsonPrimitive?.content.orEmpty(),
+            resultados = jsonObject["resultados"]?.jsonPrimitive?.content.orEmpty(),
+            conclusao = jsonObject["conclusao"]?.jsonPrimitive?.content.orEmpty()
+        )
+    }
+}
